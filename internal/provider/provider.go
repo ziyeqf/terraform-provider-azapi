@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 
@@ -249,6 +250,15 @@ func azureProvider() *schema.Provider {
 			"default_location": location.SchemaLocation(),
 
 			"default_tags": tags.SchemaTags(),
+
+			"custom_headers": {
+				Type: schema.TypeMap,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
+				Optional:    true,
+				Description: "The custom headers that will be sent in the out going requests by each resource client",
+			},
 		},
 
 		DataSourcesMap: dataSources,
@@ -339,6 +349,13 @@ func providerConfigure(p *schema.Provider) schema.ConfigureContextFunc {
 			return nil, diag.Errorf("failed to obtain a credential: %v", err)
 		}
 
+		customHeaders := http.Header{}
+		if raw, ok := d.Get("custom_headers").(map[string]interface{}); ok {
+			for k, v := range raw {
+				customHeaders[k] = []string{v.(string)}
+			}
+		}
+
 		copt := &clients.Option{
 			Cred:                 cred,
 			CloudCfg:             cloudConfig,
@@ -354,6 +371,7 @@ func providerConfigure(p *schema.Provider) schema.ConfigureContextFunc {
 			DisableCorrelationRequestID: d.Get("disable_correlation_request_id").(bool),
 			CustomCorrelationRequestID:  d.Get("custom_correlation_request_id").(string),
 			SubscriptionId:              d.Get("subscription_id").(string),
+			CustomHeaders:               customHeaders,
 		}
 
 		//lint:ignore SA1019 SDKv2 migration - staticcheck's own linter directives are currently being ignored under golanci-lint

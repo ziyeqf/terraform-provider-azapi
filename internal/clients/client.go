@@ -3,6 +3,7 @@ package clients
 import (
 	"context"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -34,6 +35,7 @@ type Option struct {
 	CloudCfg                    cloud.Configuration
 	CustomCorrelationRequestID  string
 	SubscriptionId              string
+	CustomHeaders               http.Header
 }
 
 // NOTE: it should be possible for this method to become Private once the top level Client's removed
@@ -47,7 +49,7 @@ func (client *Client) Build(ctx context.Context, o *Option) error {
 	})
 
 	perCallPolicies := make([]policy.Policy, 0)
-	perCallPolicies = append(perCallPolicies, withUserAgent(o.ApplicationUserAgent))
+	perCallPolicies = append(perCallPolicies, withUserAgent(o.ApplicationUserAgent), NewCustomHeaderPolicy(o.CustomHeaders))
 	if !o.DisableCorrelationRequestID {
 		id := o.CustomCorrelationRequestID
 		if id == "" {
