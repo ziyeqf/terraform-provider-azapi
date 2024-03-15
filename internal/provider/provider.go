@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
@@ -123,6 +124,12 @@ func azureProvider() *schema.Provider {
 			// },
 
 			// Client Certificate specific fields
+			"client_certificate": {
+				Type:        schema.TypeString,
+				Optional:    true,
+				DefaultFunc: schema.EnvDefaultFunc("ARM_CLIENT_CERTIFICATE", ""),
+				Description: "Base64 encoded PKCS#12 certificate bundle to use when authenticating as a Service Principal using a Client Certificate",
+			},
 			"client_certificate_path": {
 				Type:        schema.TypeString,
 				Optional:    true,
@@ -449,14 +456,37 @@ func newDefaultAzureCredential(d *schema.ResourceData, options *azidentity.Defau
 		}
 	}
 
-	envCred, err := azidentity.NewEnvironmentCredential(&azidentity.EnvironmentCredentialOptions{
+	var err error
+	var certData []byte
+	if v := d.Get("client_certificate").(string); v != "" {
+		certData, err = base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			return nil, fmt.Errorf(`failed to base64 decode certificate data: %v`, err)
+		}
+	}
+	if certPath := d.Get("client_certificate_path").(string); certPath != "" {
+		certData, err = os.ReadFile(certPath)
+		if err != nil {
+			return nil, fmt.Errorf(`failed to read certificate file "%s": %v`, certPath, err)
+		}
+	}
+	var password []byte
+	if v := d.Get("client_certificate_password").(string); v != "" {
+		password = []byte(v)
+	}
+	certs, key, err := azidentity.ParseCertificates(certData, password)
+	if err != nil {
+		return nil, fmt.Errorf(`failed to parse certificate: %v`, err)
+	}
+	o := &azidentity.ClientCertificateCredentialOptions{
 		ClientOptions:            options.ClientOptions,
 		DisableInstanceDiscovery: options.DisableInstanceDiscovery,
-	})
-	if err == nil {
-		creds = append(creds, envCred)
+		SendCertificateChain:     true,
+	}
+	if cred, err := azidentity.NewClientCertificateCredential(d.Get("tenant_id").(string), d.Get("client_id").(string), certs, key, o); err == nil {
+		creds = append(creds, cred)
 	} else {
-		log.Printf("newDefaultAzureCredential failed to initialize environment credential:\n\t%s", err.Error())
+		log.Printf("new client certificate credential failed:\n\t%s", err.Error())
 	}
 
 	if d.Get("use_msi").(bool) {
