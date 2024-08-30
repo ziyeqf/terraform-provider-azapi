@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 
@@ -70,6 +71,7 @@ type providerData struct {
 	DefaultLocation              types.String `tfsdk:"default_location"`
 	DefaultTags                  types.Map    `tfsdk:"default_tags"`
 	EnableHCLOutputForDataSource types.Bool   `tfsdk:"enable_hcl_output_for_data_source"`
+	CustomHeaders                types.Map    `tfsdk:"custom_headers"`
 }
 
 func (model providerData) GetClientId() (*string, error) {
@@ -352,6 +354,12 @@ func (p Provider) Schema(ctx context.Context, request provider.SchemaRequest, re
 				Optional:    true,
 				Description: "Enable HCL output for data sources. The default is false. When set to true, the provider will return HCL output for data sources. When set to false, the provider will return JSON output for data sources.",
 			},
+
+			"custom_headers": schema.MapAttribute{
+				ElementType: types.StringType,
+				Optional:    true,
+				Description: "The custom headers that will be sent in the out going requests by each resource client",
+			},
 		},
 	}
 }
@@ -619,6 +627,11 @@ func (p Provider) Configure(ctx context.Context, request provider.ConfigureReque
 		return
 	}
 
+	customHeaders := http.Header{}
+	for k, v := range model.CustomHeaders.Elements() {
+		customHeaders[k] = []string{v.(basetypes.StringValue).ValueString()}
+	}
+
 	copt := &clients.Option{
 		Cred:                 cred,
 		CloudCfg:             cloudConfig,
@@ -636,6 +649,7 @@ func (p Provider) Configure(ctx context.Context, request provider.ConfigureReque
 		CustomCorrelationRequestID:  model.CustomCorrelationRequestID.ValueString(),
 		SubscriptionId:              model.SubscriptionID.ValueString(),
 		TenantId:                    model.TenantID.ValueString(),
+		CustomHeaders:               customHeaders,
 	}
 
 	client := &clients.Client{}
@@ -822,6 +836,7 @@ func buildClientCertificateCredential(model providerData, options azidentity.Def
 		AdditionallyAllowedTenants: options.AdditionallyAllowedTenants,
 		ClientOptions:              options.ClientOptions,
 		DisableInstanceDiscovery:   options.DisableInstanceDiscovery,
+		SendCertificateChain:       true,
 	}
 	return azidentity.NewClientCertificateCredential(options.TenantID, *clientID, certs, key, o)
 }
