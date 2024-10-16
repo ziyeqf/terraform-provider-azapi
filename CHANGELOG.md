@@ -1,3 +1,46 @@
+## v2.0.1
+ENHANCEMENTS:
+- `azapi_data_plane_resource` resource: Support `Microsoft.Purview/accounts/Scanning/managedvirtualnetworks` type.
+- Support a default retry policy that retries when GET request fails with 404 status code after resource creation.
+- `azapi_resource`, `azapi_update_resource` resources and data sources' `output` field defaults to the readonly fields when the `response_export_values` is not specified.
+- `azapi_resource_list` data source's `output` field defaults to the response when the `response_export_values` is not specified.
+- `azapi` provider: Support `disable_default_output` field, which is used to disable the default output for the resources and data sources.
+- Update bicep types to https://github.com/ms-henglu/bicep-types-az/commit/c3ff45dfffe7f229447639b5982a1e2deadc1b71
+
+BUG FIXES:
+- Fix a bug that non-standard LRO error responses are not handled properly.
+
+## v2.0.0-beta
+BREAKING CHANGES:
+- Provider field `default_naming_prefix` and `default_naming_suffix` are removed. Please specify the naming prefix and suffix in the resource's `name` field instead.
+- Provider field `enable_hcl_output_for_data_source` is removed. The `output` field in the data source is always in HCL format.
+- The `azapi_resource`'s `removing_special_chars` field is removed. Please specify the `name` field and remove the special characters in the `name` field instead.
+- The `ignore_body_changes` field is removed. Please use the `lifecyle.ignore_changes` to ignore some properties when comparing the resource with its current state.
+- The `body` field now only accepts an HCL object. Please remove the `jsonencode` function when using the `body` field.
+- The `output` field now only exports an HCL object. Please remove the `jsondecode` function when using the `output` field.
+- The `use_msi` field now defaults to `false`, please set it to `true` explicitly if you want to authenticate using Managed Service Identity.
+
+FEATURES:
+- **New Provider Function**: build_resource_id
+- **New Provider Function**: parse_resource_id
+- **New Provider Function**: subscription_resource_id
+- **New Provider Function**: tenant_resource_id
+- **New Provider Function**: management_group_resource_id
+- **New Provider Function**: resource_group_resource_id
+- **New Provider Function**: extension_resource_id
+
+ENHANCEMENTS:
+- `azapi` provider: Support `enable_preflight` field, which is used to enable Preflight Validation, the default value is `false`.
+- `azapi_resource` and `azapi_data_plane_resource` resource: Support `replace_triggers_external_values` field which is used to trigger a replacement of the resource.
+- `azapi_resource` and `azapi_data_plane_resource` resource: Support `replace_triggers_refs` field which is used to trigger a replacement of the resource.
+- `azapi` resources and data sources: Support `retry` field, which is used to specify the retry configuration.
+- `azapi` resources and data sources: Support `headers` and `query_parameters` fields, which are used to specify the headers and query parameters.
+- `azapi` resources and data sources: The `response_export_values` field supports JMESPath expressions.
+- Accept `AZURE_CLIENT_ID` and `AZURE_TENANT_ID` environment variables when authenticating using AKS workload identity.
+- `azapi` provider: Support `oidc_azure_service_connection_id` field, which is used to specify the Azure Service Connection ID for OIDC authentication with Azure DevOps.
+- Update bicep types to https://github.com/ms-henglu/bicep-types-az/commit/7492c6d0a12a07f97b955661bf6df83d51bbb14d
+
+
 ## v1.15.0
 
 ENHANCEMENTS:
@@ -31,8 +74,8 @@ BUG FIXES:
 ENHANCEMENTS:
 - `azapi` provider: Support `enable_hcl_output_for_data_source` field, which is used to enable the HCL output for the data source, the default value is `false`.
   This could resolve the following breaking changes in the previous release:
-  - `azapi_resource` data source: The `output` field changes from JSON string to HCL object. Users can use access the fields in the output as an HCL object. Please remove the `jsondecode` function when using the `output` field.
-  - `azapi_resource_list` data source: The `output` field changes from JSON string to HCL object. Users can use access the fields in the output as an HCL object. Please remove the `jsondecode` function when using the `output` field.
+- `azapi_resource` data source: The `output` field changes from JSON string to HCL object. Users can use access the fields in the output as an HCL object. Please remove the `jsondecode` function when using the `output` field.
+- `azapi_resource_list` data source: The `output` field changes from JSON string to HCL object. Users can use access the fields in the output as an HCL object. Please remove the `jsondecode` function when using the `output` field.
 
 BUG FIXES:
 - Fix a bug when upgrading from previous provider `azapi_resource` resource will set `tags` for resources that don't have `tags` in the configuration.

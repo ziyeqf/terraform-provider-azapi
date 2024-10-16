@@ -16,15 +16,20 @@ import (
 	"github.com/Azure/terraform-provider-azapi/internal/azure/tags"
 	aztypes "github.com/Azure/terraform-provider-azapi/internal/azure/types"
 	"github.com/Azure/terraform-provider-azapi/internal/clients"
+	"github.com/Azure/terraform-provider-azapi/internal/docstrings"
 	"github.com/Azure/terraform-provider-azapi/internal/locks"
+	"github.com/Azure/terraform-provider-azapi/internal/retry"
 	"github.com/Azure/terraform-provider-azapi/internal/services/defaults"
 	"github.com/Azure/terraform-provider-azapi/internal/services/dynamic"
 	"github.com/Azure/terraform-provider-azapi/internal/services/migration"
 	"github.com/Azure/terraform-provider-azapi/internal/services/myplanmodifier"
+	"github.com/Azure/terraform-provider-azapi/internal/services/myplanmodifier/planmodifierdynamic"
 	"github.com/Azure/terraform-provider-azapi/internal/services/myvalidator"
 	"github.com/Azure/terraform-provider-azapi/internal/services/parse"
+	"github.com/Azure/terraform-provider-azapi/internal/services/preflight"
 	"github.com/Azure/terraform-provider-azapi/internal/tf"
 	"github.com/Azure/terraform-provider-azapi/utils"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
@@ -43,23 +48,32 @@ import (
 )
 
 type AzapiResourceModel struct {
-	ID                      types.String   `tfsdk:"id"`
-	Name                    types.String   `tfsdk:"name"`
-	ParentID                types.String   `tfsdk:"parent_id"`
-	Type                    types.String   `tfsdk:"type"`
-	Location                types.String   `tfsdk:"location"`
-	Identity                types.List     `tfsdk:"identity"`
-	Body                    types.Dynamic  `tfsdk:"body"`
-	Locks                   types.List     `tfsdk:"locks"`
-	RemovingSpecialChars    types.Bool     `tfsdk:"removing_special_chars"`
-	SchemaValidationEnabled types.Bool     `tfsdk:"schema_validation_enabled"`
-	IgnoreBodyChanges       types.List     `tfsdk:"ignore_body_changes"`
-	IgnoreCasing            types.Bool     `tfsdk:"ignore_casing"`
-	IgnoreMissingProperty   types.Bool     `tfsdk:"ignore_missing_property"`
-	ResponseExportValues    types.List     `tfsdk:"response_export_values"`
-	Output                  types.Dynamic  `tfsdk:"output"`
-	Tags                    types.Map      `tfsdk:"tags"`
-	Timeouts                timeouts.Value `tfsdk:"timeouts"`
+	Body                          types.Dynamic       `tfsdk:"body"`
+	ID                            types.String        `tfsdk:"id"`
+	Identity                      types.List          `tfsdk:"identity"`
+	IgnoreCasing                  types.Bool          `tfsdk:"ignore_casing"`
+	IgnoreMissingProperty         types.Bool          `tfsdk:"ignore_missing_property"`
+	Location                      types.String        `tfsdk:"location"`
+	Locks                         types.List          `tfsdk:"locks"`
+	Name                          types.String        `tfsdk:"name"`
+	Output                        types.Dynamic       `tfsdk:"output"`
+	ParentID                      types.String        `tfsdk:"parent_id"`
+	ReplaceTriggersExternalValues types.Dynamic       `tfsdk:"replace_triggers_external_values"`
+	ReplaceTriggersRefs           types.List          `tfsdk:"replace_triggers_refs"`
+	ResponseExportValues          types.Dynamic       `tfsdk:"response_export_values"`
+	Retry                         retry.RetryValue    `tfsdk:"retry"`
+	SchemaValidationEnabled       types.Bool          `tfsdk:"schema_validation_enabled"`
+	Tags                          types.Map           `tfsdk:"tags"`
+	Timeouts                      timeouts.Value      `tfsdk:"timeouts"`
+	Type                          types.String        `tfsdk:"type"`
+	CreateHeaders                 map[string]string   `tfsdk:"create_headers"`
+	CreateQueryParameters         map[string][]string `tfsdk:"create_query_parameters"`
+	UpdateHeaders                 map[string]string   `tfsdk:"update_headers"`
+	UpdateQueryParameters         map[string][]string `tfsdk:"update_query_parameters"`
+	DeleteHeaders                 map[string]string   `tfsdk:"delete_headers"`
+	DeleteQueryParameters         map[string][]string `tfsdk:"delete_query_parameters"`
+	ReadHeaders                   map[string]string   `tfsdk:"read_headers"`
+	ReadQueryParameters           map[string][]string `tfsdk:"read_query_parameters"`
 }
 
 var _ resource.Resource = &AzapiResource{}
@@ -85,18 +99,21 @@ func (r *AzapiResource) Metadata(_ context.Context, request resource.MetadataReq
 
 func (r *AzapiResource) UpgradeState(ctx context.Context) map[int64]resource.StateUpgrader {
 	return map[int64]resource.StateUpgrader{
-		0: migration.AzapiResourceMigrationV0ToV1(ctx),
+		0: migration.AzapiResourceMigrationV0ToV2(ctx),
+		1: migration.AzapiResourceMigrationV1ToV2(ctx),
 	}
 }
 
 func (r *AzapiResource) Schema(ctx context.Context, _ resource.SchemaRequest, response *resource.SchemaResponse) {
 	response.Schema = schema.Schema{
+		MarkdownDescription: "This resource can manage any Azure Resource Manager resource.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed: true,
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 				},
+				MarkdownDescription: docstrings.Type(),
 			},
 
 			"name": schema.StringAttribute{
@@ -105,13 +122,7 @@ func (r *AzapiResource) Schema(ctx context.Context, _ resource.SchemaRequest, re
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
 				},
-			},
-
-			"removing_special_chars": schema.BoolAttribute{
-				DeprecationMessage: "This feature is deprecated and will be removed in a major release. Please use the `name` argument to specify the name of the resource.",
-				Optional:           true,
-				Computed:           true,
-				Default:            defaults.BoolDefault(false),
+				MarkdownDescription: "Specifies the name of the azure resource. Changing this forces a new resource to be created.",
 			},
 
 			"parent_id": schema.StringAttribute{
@@ -123,6 +134,7 @@ func (r *AzapiResource) Schema(ctx context.Context, _ resource.SchemaRequest, re
 				Validators: []validator.String{
 					myvalidator.StringIsResourceID(),
 				},
+				MarkdownDescription: docstrings.ParentID(),
 			},
 
 			"type": schema.StringAttribute{
@@ -130,6 +142,7 @@ func (r *AzapiResource) Schema(ctx context.Context, _ resource.SchemaRequest, re
 				Validators: []validator.String{
 					myvalidator.StringIsResourceType(),
 				},
+				MarkdownDescription: docstrings.Type(),
 			},
 
 			"location": schema.StringAttribute{
@@ -140,51 +153,76 @@ func (r *AzapiResource) Schema(ctx context.Context, _ resource.SchemaRequest, re
 						return location.Normalize(a.ValueString()) == location.Normalize(b.ValueString())
 					}),
 				},
+				MarkdownDescription: docstrings.Location(),
 			},
 
-			// The body attribute is a dynamic attribute that allows users to specify the resource body as an HCL object or a JSON string.
-			// If the body is specified as a JSON string, the underlying value will be a string
-			// TODO: Remove the support for JSON string in the next major release
+			// The body attribute is a dynamic attribute that only allows users to specify the resource body as an HCL object
 			"body": schema.DynamicAttribute{
 				Optional: true,
 				Computed: true,
-				Default:  defaults.DynamicDefault(types.StringValue("{}")),
-				Validators: []validator.Dynamic{
-					myvalidator.BodyValidator(),
-				},
+				// in the previous version, the default value is string "{}", now it's a dynamic value {}
+				Default: defaults.DynamicDefault(types.ObjectValueMust(map[string]attr.Type{}, map[string]attr.Value{})),
 				PlanModifiers: []planmodifier.Dynamic{
-					myplanmodifier.DynamicUseStateWhen(bodySemanticallyEqual),
+					myplanmodifier.DynamicUseStateWhen(dynamic.SemanticallyEqual),
+				},
+				MarkdownDescription: docstrings.Body(),
+				Validators: []validator.Dynamic{
+					myvalidator.DynamicIsNotStringValidator(),
 				},
 			},
 
-			"ignore_body_changes": schema.ListAttribute{
-				ElementType: types.StringType,
-				Optional:    true,
-				Validators: []validator.List{
-					listvalidator.ValueStringsAre(myvalidator.StringIsNotEmpty()),
+			"replace_triggers_external_values": schema.DynamicAttribute{
+				Optional: true,
+				MarkdownDescription: "Will trigger a replace of the resource when the value changes and is not `null`. This can be used by practitioners to force a replace of the resource when certain values change, e.g. changing the SKU of a virtual machine based on the value of variables or locals. " +
+					"The value is a `dynamic`, so practitioners can compose the input however they wish. For a \"break glass\" set the value to `null` to prevent the plan modifier taking effect. \n" +
+					"If you have `null` values that you do want to be tracked as affecting the resource replacement, include these inside an object. \n" +
+					"Advanced use cases are possible and resource replacement can be triggered by values external to the resource, for example when a dependent resource changes.\n\n" +
+					"e.g. to replace a resource when either the SKU or os_type attributes change:\n" +
+					"\n" +
+					"```hcl\n" +
+					"resource \"azapi_resource\" \"example\" {\n" +
+					"  name      = var.name\n" +
+					"  type      = \"Microsoft.Network/publicIPAddresses@2023-11-01\"\n" +
+					"  parent_id = \"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/example\"\n" +
+					"  body      = {\n" +
+					"    properties = {\n" +
+					"      sku   = var.sku\n" +
+					"      zones = var.zones\n" +
+					"    }\n" +
+					"  }\n" +
+					"\n" +
+					"  replace_triggers_external_values = [\n" +
+					"    var.sku,\n" +
+					"    var.zones,\n" +
+					"  ]\n" +
+					"}\n" +
+					"```\n",
+				PlanModifiers: []planmodifier.Dynamic{
+					planmodifierdynamic.RequiresReplaceIfNotNull(),
 				},
-				DeprecationMessage: "This feature is deprecated and will be removed in a major release. Please use the `lifecycle.ignore_changes` argument to specify the fields in `body` to ignore.",
+			},
+
+			"replace_triggers_refs": schema.ListAttribute{
+				ElementType:         types.StringType,
+				Optional:            true,
+				MarkdownDescription: "A list of paths in the current Terraform configuration. When the values at these paths change, the resource will be replaced.",
 			},
 
 			"ignore_casing": schema.BoolAttribute{
-				Optional: true,
-				Computed: true,
-				Default:  defaults.BoolDefault(false),
+				Optional:            true,
+				Computed:            true,
+				Default:             defaults.BoolDefault(false),
+				MarkdownDescription: docstrings.IgnoreCasing(),
 			},
 
 			"ignore_missing_property": schema.BoolAttribute{
-				Optional: true,
-				Computed: true,
-				Default:  defaults.BoolDefault(true),
+				Optional:            true,
+				Computed:            true,
+				Default:             defaults.BoolDefault(true),
+				MarkdownDescription: docstrings.IgnoreMissingProperty(),
 			},
 
-			"response_export_values": schema.ListAttribute{
-				ElementType: types.StringType,
-				Optional:    true,
-				Validators: []validator.List{
-					listvalidator.ValueStringsAre(myvalidator.StringIsNotEmpty()),
-				},
-			},
+			"response_export_values": CommonAttributeResponseExportValues(),
 
 			"locks": schema.ListAttribute{
 				ElementType: types.StringType,
@@ -192,16 +230,19 @@ func (r *AzapiResource) Schema(ctx context.Context, _ resource.SchemaRequest, re
 				Validators: []validator.List{
 					listvalidator.ValueStringsAre(myvalidator.StringIsNotEmpty()),
 				},
+				MarkdownDescription: docstrings.Locks(),
 			},
 
 			"schema_validation_enabled": schema.BoolAttribute{
-				Optional: true,
-				Computed: true,
-				Default:  defaults.BoolDefault(true),
+				Optional:            true,
+				Computed:            true,
+				Default:             defaults.BoolDefault(true),
+				MarkdownDescription: docstrings.SchemaValidationEnabled(),
 			},
 
 			"output": schema.DynamicAttribute{
-				Computed: true,
+				Computed:            true,
+				MarkdownDescription: docstrings.Output("azapi_resource"),
 			},
 
 			"tags": schema.MapAttribute{
@@ -211,6 +252,65 @@ func (r *AzapiResource) Schema(ctx context.Context, _ resource.SchemaRequest, re
 				Validators: []validator.Map{
 					tags.Validator(),
 				},
+				MarkdownDescription: "A mapping of tags which should be assigned to the Azure resource.",
+			},
+
+			"retry": retry.SingleNestedAttribute(ctx),
+
+			"create_headers": schema.MapAttribute{
+				ElementType:         types.StringType,
+				Optional:            true,
+				MarkdownDescription: "A mapping of headers to be sent with the create request.",
+			},
+
+			"create_query_parameters": schema.MapAttribute{
+				ElementType: types.ListType{
+					ElemType: types.StringType,
+				},
+				Optional:            true,
+				MarkdownDescription: "A mapping of query parameters to be sent with the create request.",
+			},
+
+			"update_headers": schema.MapAttribute{
+				ElementType:         types.StringType,
+				Optional:            true,
+				MarkdownDescription: "A mapping of headers to be sent with the update request.",
+			},
+
+			"update_query_parameters": schema.MapAttribute{
+				ElementType: types.ListType{
+					ElemType: types.StringType,
+				},
+				Optional:            true,
+				MarkdownDescription: "A mapping of query parameters to be sent with the update request.",
+			},
+
+			"delete_headers": schema.MapAttribute{
+				ElementType:         types.StringType,
+				Optional:            true,
+				MarkdownDescription: "A mapping of headers to be sent with the delete request.",
+			},
+
+			"delete_query_parameters": schema.MapAttribute{
+				ElementType: types.ListType{
+					ElemType: types.StringType,
+				},
+				Optional:            true,
+				MarkdownDescription: "A mapping of query parameters to be sent with the delete request.",
+			},
+
+			"read_headers": schema.MapAttribute{
+				ElementType:         types.StringType,
+				Optional:            true,
+				MarkdownDescription: "A mapping of headers to be sent with the read request.",
+			},
+
+			"read_query_parameters": schema.MapAttribute{
+				ElementType: types.ListType{
+					ElemType: types.StringType,
+				},
+				Optional:            true,
+				MarkdownDescription: "A mapping of query parameters to be sent with the read request.",
 			},
 		},
 		Blocks: map[string]schema.Block{
@@ -226,6 +326,7 @@ func (r *AzapiResource) Schema(ctx context.Context, _ resource.SchemaRequest, re
 								string(identity.SystemAssigned),
 								string(identity.None),
 							)},
+							MarkdownDescription: docstrings.IdentityType(),
 						},
 
 						"identity_ids": schema.ListAttribute{
@@ -234,14 +335,17 @@ func (r *AzapiResource) Schema(ctx context.Context, _ resource.SchemaRequest, re
 							Validators: []validator.List{
 								listvalidator.ValueStringsAre(myvalidator.StringIsUserAssignedIdentityID()),
 							},
+							MarkdownDescription: docstrings.IdentityIds(),
 						},
 
 						"principal_id": schema.StringAttribute{
-							Computed: true,
+							Computed:            true,
+							MarkdownDescription: docstrings.IdentityPrincipalID(),
 						},
 
 						"tenant_id": schema.StringAttribute{
-							Computed: true,
+							Computed:            true,
+							MarkdownDescription: docstrings.IdentityTenantID(),
 						},
 					},
 				},
@@ -255,7 +359,7 @@ func (r *AzapiResource) Schema(ctx context.Context, _ resource.SchemaRequest, re
 			}),
 		},
 
-		Version: 1,
+		Version: 2,
 	}
 }
 
@@ -319,14 +423,17 @@ func (r *AzapiResource) ModifyPlan(ctx context.Context, request resource.ModifyP
 	if state != nil {
 		plan.Output = state.Output
 	}
-	resourceType := config.Type.ValueString()
+
+	azureResourceType, apiVersion, err := utils.GetAzureResourceTypeApiVersion(config.Type.ValueString())
+	if err != nil {
+		response.Diagnostics.AddError("Invalid configuration", fmt.Sprintf(`The argument "type" is invalid: %s`, err.Error()))
+		return
+	}
+	resourceDef, _ := azure.GetResourceDefinition(azureResourceType, apiVersion)
 
 	// for resource group, if parent_id is not specified, set it to subscription id
-	if config.ParentID.IsNull() {
-		azureResourceType, _, _ := utils.GetAzureResourceTypeApiVersion(resourceType)
-		if strings.EqualFold(azureResourceType, arm.ResourceGroupResourceType.String()) {
-			plan.ParentID = types.StringValue(fmt.Sprintf("/subscriptions/%s", r.ProviderData.Account.GetSubscriptionId()))
-		}
+	if config.ParentID.IsNull() && strings.EqualFold(azureResourceType, arm.ResourceGroupResourceType.String()) {
+		plan.ParentID = types.StringValue(fmt.Sprintf("/subscriptions/%s", r.ProviderData.Account.GetSubscriptionId()))
 	}
 
 	if name, diags := r.nameWithDefaultNaming(config.Name); !diags.HasError() {
@@ -349,6 +456,12 @@ func (r *AzapiResource) ModifyPlan(ctx context.Context, request resource.ModifyP
 		}
 	}
 
+	isNewResource := state == nil
+	if !dynamic.IsFullyKnown(plan.Body) || isNewResource || !plan.Identity.Equal(state.Identity) ||
+		!plan.Type.Equal(state.Type) ||
+		!plan.ResponseExportValues.Equal(state.ResponseExportValues) || !dynamic.SemanticallyEqual(plan.Body, state.Body) {
+		plan.Output = basetypes.NewDynamicUnknown()
+	}
 	if !dynamic.IsFullyKnown(plan.Body) {
 		if config.Tags.IsNull() {
 			plan.Tags = basetypes.NewMapUnknown(types.StringType)
@@ -356,55 +469,106 @@ func (r *AzapiResource) ModifyPlan(ctx context.Context, request resource.ModifyP
 		if config.Location.IsNull() {
 			plan.Location = basetypes.NewStringUnknown()
 		}
-		plan.Output = basetypes.NewDynamicUnknown()
-		return
 	}
 
-	if state == nil || !plan.Identity.Equal(state.Identity) || !plan.ResponseExportValues.Equal(state.ResponseExportValues) ||
-		!bodySemanticallyEqual(plan.Body, state.Body) {
-		plan.Output = basetypes.NewDynamicUnknown()
-	}
-
-	body := make(map[string]interface{})
-	if err := unmarshalBody(config.Body, &body); err != nil {
-		response.Diagnostics.AddError("Invalid body", fmt.Sprintf(`The argument "body" is invalid: %s`, err.Error()))
-		return
-	}
-
-	azureResourceType, apiVersion, err := utils.GetAzureResourceTypeApiVersion(config.Type.ValueString())
-	if err != nil {
-		response.Diagnostics.AddError("Invalid configuration", fmt.Sprintf(`The argument "type" is invalid: %s`, err.Error()))
-		return
-	}
-	resourceDef, _ := azure.GetResourceDefinition(azureResourceType, apiVersion)
-
-	plan.Tags = r.tagsWithDefaultTags(config.Tags, body, state, resourceDef)
-	if state == nil || !state.Tags.Equal(plan.Tags) {
-		plan.Output = basetypes.NewDynamicUnknown()
-	}
-
-	// location field has a field level plan modifier which suppresses the diff if the location is not actually changed
-	locationValue := plan.Location
-	// For the following cases, we need to use the location in config as the specified location
-	// case 1. To create a new resource, the location is not specified in config, then the planned location will be unknown
-	// case 2. To update a resource, the location is not specified in config, then the planned location will be the state location
-	if locationValue.IsUnknown() || config.Location.IsNull() {
-		locationValue = config.Location
-	}
-	// locationWithDefaultLocation will return the location in config if it's not null, otherwise it will return the default location if it supports location
-	plan.Location = r.locationWithDefaultLocation(locationValue, body, state, resourceDef)
-	if state != nil && location.Normalize(state.Location.ValueString()) != location.Normalize(plan.Location.ValueString()) {
-		// if the location is changed, replace the resource
-		response.RequiresReplace.Append(path.Root("location"))
-	}
-	if plan.SchemaValidationEnabled.ValueBool() {
-		if response.Diagnostics.Append(expandBody(body, *plan)...); response.Diagnostics.HasError() {
+	if dynamic.IsFullyKnown(plan.Body) {
+		body := make(map[string]interface{})
+		if err := unmarshalBody(config.Body, &body); err != nil {
+			response.Diagnostics.AddError("Invalid body", fmt.Sprintf(`The argument "body" is invalid: %s`, err.Error()))
 			return
 		}
-		body["name"] = plan.Name.ValueString()
-		err = schemaValidation(azureResourceType, apiVersion, resourceDef, body)
+
+		plan.Tags = r.tagsWithDefaultTags(config.Tags, body, state, resourceDef)
+		if state == nil || !state.Tags.Equal(plan.Tags) {
+			plan.Output = basetypes.NewDynamicUnknown()
+		}
+
+		// location field has a field level plan modifier which suppresses the diff if the location is not actually changed
+		locationValue := plan.Location
+		// For the following cases, we need to use the location in config as the specified location
+		// case 1. To create a new resource, the location is not specified in config, then the planned location will be unknown
+		// case 2. To update a resource, the location is not specified in config, then the planned location will be the state location
+		if locationValue.IsUnknown() || config.Location.IsNull() {
+			locationValue = config.Location
+		}
+		// locationWithDefaultLocation will return the location in config if it's not null, otherwise it will return the default location if it supports location
+		plan.Location = r.locationWithDefaultLocation(locationValue, body, state, resourceDef)
+		if state != nil && location.Normalize(state.Location.ValueString()) != location.Normalize(plan.Location.ValueString()) {
+			// if the location is changed, replace the resource
+			response.RequiresReplace.Append(path.Root("location"))
+		}
+		if plan.SchemaValidationEnabled.ValueBool() {
+			if response.Diagnostics.Append(expandBody(body, *plan)...); response.Diagnostics.HasError() {
+				return
+			}
+			body["name"] = plan.Name.ValueString()
+			err = schemaValidation(azureResourceType, apiVersion, resourceDef, body)
+			if err != nil {
+				response.Diagnostics.AddError("Invalid configuration", err.Error())
+				return
+			}
+		}
+
+		// Check if any paths in replace_triggers_refs have changed
+		if state != nil && plan != nil && !plan.ReplaceTriggersRefs.IsNull() {
+			refPaths := make(map[string]string)
+			for pathIndex, refPath := range AsStringList(plan.ReplaceTriggersRefs) {
+				refPaths[fmt.Sprintf("%d", pathIndex)] = refPath
+			}
+
+			// read previous values from state
+			stateData, err := dynamic.ToJSON(state.Body)
+			if err != nil {
+				response.Diagnostics.AddError("Invalid state body configuration", err.Error())
+				return
+			}
+			var stateModel interface{}
+			err = json.Unmarshal(stateData, &stateModel)
+			if err != nil {
+				response.Diagnostics.AddError("Invalid state body configuration", err.Error())
+				return
+			}
+			previousValues := flattenOutputJMES(stateModel, refPaths)
+
+			// read current values from plan
+			planData, err := dynamic.ToJSON(plan.Body)
+			if err != nil {
+				response.Diagnostics.AddError("Invalid plan body configuration", err.Error())
+				return
+			}
+			var planModel interface{}
+			err = json.Unmarshal(planData, &planModel)
+			if err != nil {
+				response.Diagnostics.AddError("Invalid plan body configuration", err.Error())
+				return
+			}
+			currentValues := flattenOutputJMES(planModel, refPaths)
+
+			// compare previous and current values
+			if !reflect.DeepEqual(previousValues, currentValues) {
+				response.RequiresReplace.Append(path.Root("body"))
+			}
+		}
+	}
+
+	if r.ProviderData.Features.EnablePreflight && isNewResource && preflight.IsSupported(plan.Type.ValueString(), plan.ParentID.ValueString()) {
+		parentId := plan.ParentID.ValueString()
+		if parentId == "" {
+			placeholder, err := preflight.ParentIdPlaceholder(resourceDef, r.ProviderData.Account.GetSubscriptionId())
+			if err != nil {
+				return
+			}
+			parentId = placeholder
+		}
+
+		name := plan.Name.ValueString()
+		if name == "" {
+			name = preflight.NamePlaceholder()
+		}
+
+		err = preflight.Validate(ctx, r.ProviderData.ResourceClient, plan.Type.ValueString(), parentId, name, plan.Location.ValueString(), plan.Body, plan.Identity)
 		if err != nil {
-			response.Diagnostics.AddError("Invalid configuration", err.Error())
+			response.Diagnostics.AddError("Preflight Validation: Invalid configuration", err.Error())
 			return
 		}
 	}
@@ -432,7 +596,18 @@ func (r *AzapiResource) CreateUpdate(ctx context.Context, requestPlan tfsdk.Plan
 		return
 	}
 
-	client := r.ProviderData.ResourceClient
+	var client clients.Requester
+	client = r.ProviderData.ResourceClient
+	if !plan.Retry.IsNull() {
+		bkof, regexps := clients.NewRetryableErrors(
+			plan.Retry.GetIntervalSeconds(),
+			plan.Retry.GetMaxIntervalSeconds(),
+			plan.Retry.GetMultiplier(),
+			plan.Retry.GetRandomizationFactor(),
+			plan.Retry.GetErrorMessageRegex(),
+		)
+		client = r.ProviderData.ResourceClient.WithRetry(bkof, regexps, nil, nil)
+	}
 	isNewResource := responseState == nil || responseState.Raw.IsNull()
 
 	var timeout time.Duration
@@ -452,13 +627,16 @@ func (r *AzapiResource) CreateUpdate(ctx context.Context, requestPlan tfsdk.Plan
 	defer cancel()
 
 	if isNewResource {
-		// check if the resource already exists
-		_, err = client.Get(ctx, id.AzureResourceId, id.ApiVersion)
+		// check if the resource already exists using the non-retry client to avoid issue where user specifies
+		// a FooResourceNotFound error as a retryable error
+		_, err = r.ProviderData.ResourceClient.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(plan.ReadHeaders, plan.ReadQueryParameters))
 		if err == nil {
 			diagnostics.AddError("Resource already exists", tf.ImportAsExistsError("azapi_resource", id.ID()).Error())
 			return
 		}
-		if !utils.ResponseErrorWasNotFound(err) {
+
+		// 403 is returned if group does not exist, bug tracked at: https://github.com/Azure/azure-rest-api-specs/issues/9549
+		if !utils.ResponseErrorWasNotFound(err) && !(utils.ResponseWasForbidden(err) && strings.EqualFold("Microsoft.Management/managementGroups", id.AzureResourceType)) {
 			diagnostics.AddError("Failed to retrieve resource", fmt.Errorf("checking for presence of existing %s: %+v", id, err).Error())
 			return
 		}
@@ -481,28 +659,6 @@ func (r *AzapiResource) CreateUpdate(ctx context.Context, requestPlan tfsdk.Plan
 			out, _ := identity.ExpandIdentity(noneIdentity)
 			body["identity"] = out
 		}
-
-		// handle the case that `ignore_body_changes` is set
-		if ignoreChanges := AsStringList(plan.IgnoreBodyChanges); len(ignoreChanges) != 0 {
-			// retrieve the existing resource
-			existing, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion)
-			if err != nil {
-				diagnostics.AddError("Failed to retrieve resource", fmt.Errorf("reading %s: %+v", id, err).Error())
-				return
-			}
-
-			merged, err := overrideWithPaths(body, existing, ignoreChanges)
-			if err != nil {
-				diagnostics.AddError("Invalid configuration", fmt.Sprintf(`The argument "ignore_body_changes" is invalid: value: %s, err: %+v`, plan.IgnoreBodyChanges.String(), err))
-				return
-			}
-
-			if id.ResourceDef != nil {
-				merged = (*id.ResourceDef).GetWriteOnly(utils.NormalizeObject(merged))
-			}
-
-			body = merged.(map[string]interface{})
-		}
 	}
 
 	// create/update the resource
@@ -511,17 +667,28 @@ func (r *AzapiResource) CreateUpdate(ctx context.Context, requestPlan tfsdk.Plan
 		defer locks.UnlockByID(lockId)
 	}
 
-	_, err = client.CreateOrUpdate(ctx, id.AzureResourceId, id.ApiVersion, body)
+	options := clients.NewRequestOptions(plan.CreateHeaders, plan.CreateQueryParameters)
+	if !isNewResource {
+		options = clients.NewRequestOptions(plan.UpdateHeaders, plan.UpdateQueryParameters)
+	}
+	_, err = client.CreateOrUpdate(ctx, id.AzureResourceId, id.ApiVersion, body, options)
 	if err != nil {
 		if isNewResource {
-			if responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion); err == nil {
+			if responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(plan.ReadHeaders, plan.ReadQueryParameters)); err == nil {
 				// generate the computed fields
 				plan.ID = types.StringValue(id.ID())
-				if dynamicIsString(plan.Body) {
-					plan.Output = types.DynamicValue(types.StringValue(flattenOutput(responseBody, AsStringList(plan.ResponseExportValues))))
-				} else {
-					plan.Output = types.DynamicValue(flattenOutputPayload(responseBody, AsStringList(plan.ResponseExportValues)))
+
+				var defaultOutput interface{}
+				if !r.ProviderData.Features.DisableDefaultOutput {
+					defaultOutput = id.ResourceDef.GetReadOnly(responseBody)
 				}
+				output, err := buildOutputFromBody(responseBody, plan.ResponseExportValues, defaultOutput)
+				if err != nil {
+					diagnostics.AddError("Failed to build output", err.Error())
+					return
+				}
+				plan.Output = output
+
 				if bodyMap, ok := responseBody.(map[string]interface{}); ok {
 					if !plan.Identity.IsNull() {
 						planIdentity := identity.FromList(plan.Identity)
@@ -541,8 +708,22 @@ func (r *AzapiResource) CreateUpdate(ctx context.Context, requestPlan tfsdk.Plan
 		diagnostics.AddError("Failed to create/update resource", fmt.Errorf("creating/updating %s: %+v", id, err).Error())
 		return
 	}
-
-	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion)
+	// Create a new retry client to handle specific case of transient 404 after resource creation
+	clientRetry404 := r.ProviderData.ResourceClient.WithRetry(
+		backoff.NewExponentialBackOff(
+			backoff.WithInitialInterval(5*time.Second),
+			backoff.WithMaxInterval(30*time.Second),
+			backoff.WithMaxElapsedTime(Retry404MaxElapsedTime()),
+		),
+		nil,
+		[]int{404},
+		[]func(d interface{}) bool{
+			func(d interface{}) bool {
+				return d == nil
+			},
+		},
+	)
+	responseBody, err := clientRetry404.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(plan.ReadHeaders, plan.ReadQueryParameters))
 	if err != nil {
 		if utils.ResponseErrorWasNotFound(err) {
 			tflog.Info(ctx, fmt.Sprintf("Error reading %q - removing from state", id.ID()))
@@ -555,11 +736,18 @@ func (r *AzapiResource) CreateUpdate(ctx context.Context, requestPlan tfsdk.Plan
 
 	// generate the computed fields
 	plan.ID = types.StringValue(id.ID())
-	if dynamicIsString(plan.Body) {
-		plan.Output = types.DynamicValue(types.StringValue(flattenOutput(responseBody, AsStringList(plan.ResponseExportValues))))
-	} else {
-		plan.Output = types.DynamicValue(flattenOutputPayload(responseBody, AsStringList(plan.ResponseExportValues)))
+
+	var defaultOutput interface{}
+	if !r.ProviderData.Features.DisableDefaultOutput {
+		defaultOutput = id.ResourceDef.GetReadOnly(responseBody)
 	}
+	output, err := buildOutputFromBody(responseBody, plan.ResponseExportValues, defaultOutput)
+	if err != nil {
+		diagnostics.AddError("Failed to build output", err.Error())
+		return
+	}
+	plan.Output = output
+
 	if bodyMap, ok := responseBody.(map[string]interface{}); ok {
 		if !plan.Identity.IsNull() {
 			planIdentity := identity.FromList(plan.Identity)
@@ -598,8 +786,20 @@ func (r *AzapiResource) Read(ctx context.Context, request resource.ReadRequest, 
 		return
 	}
 
-	client := r.ProviderData.ResourceClient
-	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion)
+	var client clients.Requester
+	client = r.ProviderData.ResourceClient
+	if !model.Retry.IsNull() && !model.Retry.IsUnknown() {
+		bkof, regexps := clients.NewRetryableErrors(
+			model.Retry.GetIntervalSeconds(),
+			model.Retry.GetMaxIntervalSeconds(),
+			model.Retry.GetMultiplier(),
+			model.Retry.GetRandomizationFactor(),
+			model.Retry.GetErrorMessageRegex(),
+		)
+		client = r.ProviderData.ResourceClient.WithRetry(bkof, regexps, nil, nil)
+	}
+
+	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(model.ReadHeaders, model.ReadQueryParameters))
 	if err != nil {
 		if utils.ResponseErrorWasNotFound(err) {
 			tflog.Info(ctx, fmt.Sprintf("Error reading %q - removing from state", id.ID()))
@@ -664,15 +864,6 @@ func (r *AzapiResource) Read(ctx context.Context, request resource.ReadRequest, 
 		}
 	}
 
-	if ignoreBodyChanges := AsStringList(model.IgnoreBodyChanges); len(ignoreBodyChanges) != 0 {
-		if out, err := overrideWithPaths(responseBody, requestBody, ignoreBodyChanges); err == nil {
-			responseBody = out
-		} else {
-			response.Diagnostics.AddError("Invalid configuration", fmt.Sprintf(`The argument "ignore_body_changes" is invalid: value: %s, err: %+v`, model.IgnoreBodyChanges.String(), err))
-			return
-		}
-	}
-
 	option := utils.UpdateJsonOption{
 		IgnoreCasing:          model.IgnoreCasing.ValueBool(),
 		IgnoreMissingProperty: model.IgnoreMissingProperty.ValueBool(),
@@ -684,35 +875,50 @@ func (r *AzapiResource) Read(ctx context.Context, request resource.ReadRequest, 
 		response.Diagnostics.AddError("Invalid body", err.Error())
 		return
 	}
+	var defaultOutput interface{}
+	if !r.ProviderData.Features.DisableDefaultOutput {
+		defaultOutput = id.ResourceDef.GetReadOnly(responseBody)
+	}
+	output, err := buildOutputFromBody(responseBody, model.ResponseExportValues, defaultOutput)
+	if err != nil {
+		response.Diagnostics.AddError("Failed to build output", err.Error())
+		return
+	}
+	state.Output = output
 
-	if dynamicIsString(model.Body) {
-		state.Body = types.DynamicValue(types.StringValue(string(data)))
-		state.Output = types.DynamicValue(types.StringValue(flattenOutput(responseBody, AsStringList(model.ResponseExportValues))))
-	} else {
-		state.Output = types.DynamicValue(flattenOutputPayload(responseBody, AsStringList(model.ResponseExportValues)))
-		if !model.Body.IsNull() {
-			payload, err := dynamic.FromJSON(data, model.Body.UnderlyingValue().Type(ctx))
+	if !model.Body.IsNull() {
+		payload, err := dynamic.FromJSON(data, model.Body.UnderlyingValue().Type(ctx))
+		if err != nil {
+			tflog.Warn(ctx, fmt.Sprintf("Failed to parse payload: %s", err.Error()))
+			payload, err = dynamic.FromJSONImplied(data)
 			if err != nil {
-				tflog.Warn(ctx, fmt.Sprintf("Failed to parse payload: %s", err.Error()))
-				payload, err = dynamic.FromJSONImplied(data)
-				if err != nil {
-					response.Diagnostics.AddError("Invalid payload", err.Error())
-					return
-				}
+				response.Diagnostics.AddError("Invalid payload", err.Error())
+				return
 			}
-			state.Body = payload
 		}
+		state.Body = payload
 	}
 
 	response.Diagnostics.Append(response.State.Set(ctx, state)...)
 }
 
 func (r *AzapiResource) Delete(ctx context.Context, request resource.DeleteRequest, response *resource.DeleteResponse) {
-	client := r.ProviderData.ResourceClient
-
 	var model *AzapiResourceModel
 	if response.Diagnostics.Append(request.State.Get(ctx, &model)...); response.Diagnostics.HasError() {
 		return
+	}
+
+	var client clients.Requester
+	client = r.ProviderData.ResourceClient
+	if !model.Retry.IsNull() && !model.Retry.IsUnknown() {
+		bkof, regexps := clients.NewRetryableErrors(
+			model.Retry.GetIntervalSeconds(),
+			model.Retry.GetMaxIntervalSeconds(),
+			model.Retry.GetMultiplier(),
+			model.Retry.GetRandomizationFactor(),
+			model.Retry.GetErrorMessageRegex(),
+		)
+		client = r.ProviderData.ResourceClient.WithRetry(bkof, regexps, nil, nil)
 	}
 
 	deleteTimeout, diags := model.Timeouts.Delete(ctx, 30*time.Minute)
@@ -735,7 +941,7 @@ func (r *AzapiResource) Delete(ctx context.Context, request resource.DeleteReque
 		defer locks.UnlockByID(lockId)
 	}
 
-	_, err = client.Delete(ctx, id.AzureResourceId, id.ApiVersion)
+	_, err = client.Delete(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(model.DeleteHeaders, model.DeleteQueryParameters))
 	if err != nil && !utils.ResponseErrorWasNotFound(err) {
 		response.Diagnostics.AddError("Failed to delete resource", fmt.Errorf("deleting %s: %+v", id, err).Error())
 	}
@@ -768,21 +974,21 @@ func (r *AzapiResource) ImportState(ctx context.Context, request resource.Import
 	client := r.ProviderData.ResourceClient
 
 	state := AzapiResourceModel{
-		ID:                      types.StringValue(id.ID()),
-		Name:                    types.StringValue(id.Name),
-		ParentID:                types.StringValue(id.ParentId),
-		Type:                    types.StringValue(fmt.Sprintf("%s@%s", id.AzureResourceType, id.ApiVersion)),
-		Locks:                   types.ListNull(types.StringType),
-		Identity:                types.ListNull(identity.Model{}.ModelType()),
-		Body:                    types.DynamicNull(),
-		RemovingSpecialChars:    types.BoolValue(false),
-		SchemaValidationEnabled: types.BoolValue(true),
-		IgnoreBodyChanges:       types.ListNull(types.StringType),
-		IgnoreCasing:            types.BoolValue(false),
-		IgnoreMissingProperty:   types.BoolValue(true),
-		ResponseExportValues:    types.ListNull(types.StringType),
-		Output:                  types.DynamicNull(),
-		Tags:                    types.MapNull(types.StringType),
+		ID:                            types.StringValue(id.ID()),
+		Name:                          types.StringValue(id.Name),
+		ParentID:                      types.StringValue(id.ParentId),
+		Type:                          types.StringValue(fmt.Sprintf("%s@%s", id.AzureResourceType, id.ApiVersion)),
+		Locks:                         types.ListNull(types.StringType),
+		Identity:                      types.ListNull(identity.Model{}.ModelType()),
+		Body:                          types.DynamicNull(),
+		SchemaValidationEnabled:       types.BoolValue(true),
+		IgnoreCasing:                  types.BoolValue(false),
+		IgnoreMissingProperty:         types.BoolValue(true),
+		ResponseExportValues:          types.DynamicNull(),
+		Output:                        types.DynamicNull(),
+		ReplaceTriggersExternalValues: types.DynamicNull(),
+		ReplaceTriggersRefs:           types.ListNull(types.StringType),
+		Tags:                          types.MapNull(types.StringType),
 		Timeouts: timeouts.Value{
 			Object: types.ObjectNull(map[string]attr.Type{
 				"create": types.StringType,
@@ -793,7 +999,7 @@ func (r *AzapiResource) ImportState(ctx context.Context, request resource.Import
 		},
 	}
 
-	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion)
+	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(state.ReadHeaders, state.ReadQueryParameters))
 	if err != nil {
 		if utils.ResponseErrorWasNotFound(err) {
 			tflog.Info(ctx, fmt.Sprintf("[INFO] Error reading %q - removing from state", id.ID()))
@@ -849,6 +1055,17 @@ func (r *AzapiResource) ImportState(ctx context.Context, request resource.Import
 			state.Identity = identity.ToList(*v)
 		}
 	}
+
+	var defaultOutput interface{}
+	if !r.ProviderData.Features.DisableDefaultOutput {
+		defaultOutput = id.ResourceDef.GetReadOnly(responseBody)
+	}
+	output, err := buildOutputFromBody(responseBody, state.ResponseExportValues, defaultOutput)
+	if err != nil {
+		response.Diagnostics.AddError("Failed to build output", err.Error())
+		return
+	}
+	state.Output = output
 
 	response.Diagnostics.Append(response.State.Set(ctx, state)...)
 }
