@@ -16,29 +16,31 @@ import (
 	"github.com/Azure/terraform-provider-azapi/internal/services/myvalidator"
 	"github.com/Azure/terraform-provider-azapi/internal/services/parse"
 	"github.com/Azure/terraform-provider-azapi/utils"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
 type AzapiResourceDataSourceModel struct {
-	ID                   types.String        `tfsdk:"id"`
-	Name                 types.String        `tfsdk:"name"`
-	ParentID             types.String        `tfsdk:"parent_id"`
-	ResourceID           types.String        `tfsdk:"resource_id"`
-	Type                 types.String        `tfsdk:"type"`
-	ResponseExportValues types.Dynamic       `tfsdk:"response_export_values"`
-	Location             types.String        `tfsdk:"location"`
-	Identity             types.List          `tfsdk:"identity"`
-	Output               types.Dynamic       `tfsdk:"output"`
-	Tags                 types.Map           `tfsdk:"tags"`
-	Timeouts             timeouts.Value      `tfsdk:"timeouts"`
-	Retry                retry.RetryValue    `tfsdk:"retry"`
-	Headers              map[string]string   `tfsdk:"headers"`
-	QueryParameters      map[string][]string `tfsdk:"query_parameters"`
+	ID                   types.String     `tfsdk:"id"`
+	Name                 types.String     `tfsdk:"name"`
+	ParentID             types.String     `tfsdk:"parent_id"`
+	ResourceID           types.String     `tfsdk:"resource_id"`
+	Type                 types.String     `tfsdk:"type"`
+	ResponseExportValues types.Dynamic    `tfsdk:"response_export_values"`
+	Location             types.String     `tfsdk:"location"`
+	Identity             types.List       `tfsdk:"identity"`
+	Output               types.Dynamic    `tfsdk:"output"`
+	Tags                 types.Map        `tfsdk:"tags"`
+	Timeouts             timeouts.Value   `tfsdk:"timeouts"`
+	Retry                retry.RetryValue `tfsdk:"retry"`
+	Headers              types.Map        `tfsdk:"headers"`
+	QueryParameters      types.Map        `tfsdk:"query_parameters"`
 }
 
 type AzapiResourceDataSource struct {
@@ -47,6 +49,7 @@ type AzapiResourceDataSource struct {
 
 var _ datasource.DataSource = &AzapiResourceDataSource{}
 var _ datasource.DataSourceWithConfigure = &AzapiResourceDataSource{}
+var _ datasource.DataSourceWithValidateConfig = &AzapiResourceDataSource{}
 
 func (r *AzapiResourceDataSource) Configure(ctx context.Context, request datasource.ConfigureRequest, response *datasource.ConfigureResponse) {
 	if v, ok := request.ProviderData.(*clients.Client); ok {
@@ -75,13 +78,13 @@ func (r *AzapiResourceDataSource) Schema(ctx context.Context, request datasource
 				MarkdownDescription: docstrings.Type(),
 			},
 
-			`name`: schema.StringAttribute{
+			"name": schema.StringAttribute{
 				Optional: true,
 				Computed: true,
 				Validators: []validator.String{
 					myvalidator.StringIsNotEmpty(),
 				},
-				MarkdownDescription: "Specifies the name of the Azure resource.",
+				MarkdownDescription: "Specifies the name of the Azure resource. Exactly one of the arguments `name` or `resource_id` must be set. It could be omitted if the `type` is `Microsoft.Resources/subscriptions`.",
 			},
 
 			"parent_id": schema.StringAttribute{
@@ -99,7 +102,7 @@ func (r *AzapiResourceDataSource) Schema(ctx context.Context, request datasource
 				Validators: []validator.String{
 					myvalidator.StringIsResourceID(),
 				},
-				MarkdownDescription: "The ID of the Azure resource to retrieve.",
+				MarkdownDescription: "The ID of the Azure resource to retrieve. Exactly one of the arguments `name` or `resource_id` must be set. It could be omitted if the `type` is `Microsoft.Resources/subscriptions`.",
 			},
 
 			"location": schema.StringAttribute{
@@ -135,7 +138,10 @@ func (r *AzapiResourceDataSource) Schema(ctx context.Context, request datasource
 				},
 			},
 
-			"response_export_values": CommonAttributeResponseExportValues(),
+			"response_export_values": schema.DynamicAttribute{
+				Optional:            true,
+				MarkdownDescription: docstrings.ResponseExportValues(),
+			},
 
 			"output": schema.DynamicAttribute{
 				Computed:            true,
@@ -170,6 +176,39 @@ func (r *AzapiResourceDataSource) Schema(ctx context.Context, request datasource
 				Read: true,
 			}),
 		},
+	}
+}
+
+func (r *AzapiResourceDataSource) ValidateConfig(ctx context.Context, request datasource.ValidateConfigRequest, response *datasource.ValidateConfigResponse) {
+	var config *AzapiResourceDataSourceModel
+	if response.Diagnostics.Append(request.Config.Get(ctx, &config)...); response.Diagnostics.HasError() {
+		return
+	}
+	if config == nil {
+		return
+	}
+
+	if config.Name.IsNull() && !config.ParentID.IsNull() {
+		response.Diagnostics.AddError("Invalid configuration", `The argument "name" is required when the argument "parent_id" is set`)
+	}
+	if !config.Name.IsNull() && config.ParentID.IsNull() {
+		resourceType := config.Type.ValueString()
+		azureResourceType, _, _ := utils.GetAzureResourceTypeApiVersion(resourceType)
+		// If the resource type is not a resource group, then the parent_id is required
+		if !strings.EqualFold(azureResourceType, arm.ResourceGroupResourceType.String()) {
+			response.Diagnostics.AddError("Invalid configuration", `The argument "parent_id" is required when the argument "name" is set`)
+		}
+	}
+	if config.Name.IsNull() && config.ResourceID.IsNull() {
+		resourceType := config.Type.ValueString()
+		azureResourceType, _, _ := utils.GetAzureResourceTypeApiVersion(resourceType)
+		// If the resource type is not a subscription, then at least one of the name or resource_id must be set
+		if !strings.EqualFold(azureResourceType, arm.SubscriptionResourceType.String()) {
+			response.Diagnostics.AddError("Invalid configuration", `One of the arguments "name" or "resource_id" must be set`)
+		}
+	}
+	if !config.Name.IsNull() && !config.ResourceID.IsNull() {
+		response.Diagnostics.AddError("Invalid configuration", `Exactly one of the arguments "name" or "resource_id" can be set`)
 	}
 }
 
@@ -217,19 +256,23 @@ func (r *AzapiResourceDataSource) Read(ctx context.Context, request datasource.R
 		id = buildId
 	}
 
+	ctx = tflog.SetField(ctx, "resource_id", id.ID())
+
 	var client clients.Requester
 	client = r.ProviderData.ResourceClient
 	if !model.Retry.IsNull() && !model.Retry.IsUnknown() {
-		bkof, regexps := clients.NewRetryableErrors(
-			model.Retry.GetIntervalSeconds(),
-			model.Retry.GetMaxIntervalSeconds(),
-			model.Retry.GetMultiplier(),
-			model.Retry.GetRandomizationFactor(),
-			model.Retry.GetErrorMessageRegex(),
+		regexps := clients.StringSliceToRegexpSliceMust(model.Retry.GetErrorMessages())
+		bkof := backoff.NewExponentialBackOff(
+			backoff.WithInitialInterval(model.Retry.GetIntervalSecondsAsDuration()),
+			backoff.WithMaxInterval(model.Retry.GetMaxIntervalSecondsAsDuration()),
+			backoff.WithMultiplier(model.Retry.GetMultiplier()),
+			backoff.WithRandomizationFactor(model.Retry.GetRandomizationFactor()),
+			backoff.WithMaxElapsedTime(readTimeout),
 		)
+		tflog.Debug(ctx, "data.azapi_resource.Read is using retry")
 		client = r.ProviderData.ResourceClient.WithRetry(bkof, regexps, nil, nil)
 	}
-	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(model.Headers, model.QueryParameters))
+	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(AsMapOfString(model.Headers), AsMapOfLists(model.QueryParameters)))
 	if err != nil {
 		if utils.ResponseErrorWasNotFound(err) {
 			response.Diagnostics.AddError("Resource not found", fmt.Errorf("resource %q not found", id).Error())
@@ -258,6 +301,7 @@ func (r *AzapiResourceDataSource) Read(ctx context.Context, request datasource.R
 	var defaultOutput interface{}
 	if !r.ProviderData.Features.DisableDefaultOutput {
 		defaultOutput = id.ResourceDef.GetReadOnly(responseBody)
+		defaultOutput = utils.RemoveFields(defaultOutput, volatileFieldList())
 	}
 	output, err := buildOutputFromBody(responseBody, model.ResponseExportValues, defaultOutput)
 	if err != nil {

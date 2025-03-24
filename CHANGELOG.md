@@ -1,9 +1,49 @@
+## v2.3.0 (unreleased)
+FEATURES:
+- **New Ephemeral Resource**: azapi_resource_action
+
+ENHANCEMENTS:
+- `azapi` provider: The `oidc_azure_service_connection_id` field can be sourced from the `ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID` or `ARM_OIDC_AZURE_SERVICE_CONNECTION_ID` Environment Variables.
+- `azapi_resource_action` resource, data source: Support `sensitive_response_export_values` field, which is used to specify the sensitive fields to export.
+- `azaapi_resource_action` resource, data source: Support `sensitive_output` field, which is a sensitive computed field that contains the fields exported by `sensitive_response_export_values`.
+
+BUG FIXES:
+- Fix a bug that query parameters and headers don't work properly with unknown values
+- Fix more edge cases that the provider produced inconsistent result after apply when default output feature is enabled.
+
+
+## v2.2.0
+
+ENHANCEMENTS:
+- `azapi_resource` resource: Improved 403 handling for management group resources to include child resources
+- Update bicep types to https://github.com/ms-henglu/bicep-types-az/commit/4da2e194de989ed72552add82b9a5ead5223695b
+
+BUG FIXES:
+- Fix a bug that the provider produced inconsistent result after apply when default output feature is enabled.  
+Notice: Terraform will detect the `output` field's changes made outside of Terraform since the last "terraform apply". You can run `terraform refresh` to update the state file with the latest values.
+- Fix a bug that the GET after PUT retry timeout doesn't work properly when the environment variable is set.
+
+## v2.1.0
+FEATURES:
+- `azapi_resource` resource: Support resource move operation, it allows moving resources from `azurerm` provider.
+
+ENHANCEMENTS:
+- `azapi_client_config` data source: Support `object_id` field.
+- Update bicep types to https://github.com/ms-henglu/bicep-types-az/commit/401bed53e5495fb79f6c3357d9befb9fea158b1f
+
+BUG FIXES:
+- Fix a bug when `body` contains an unknown float number, the provider will crash.
+- Fix the crash that occurs when no tenant ID is configured in Azure CLI.
+- Fix a bug that using multiple locks can result in a deadlock.
+
 ## v2.0.1
+BREAKING CHANGES:
+- `azapi_resource`, `azapi_update_resource` resources and data sources' `output` field defaults to the readonly fields when the `response_export_values` is not specified.
+- `azapi_resource_list` data source's `output` field defaults to the response when the `response_export_values` is not specified.
+
 ENHANCEMENTS:
 - `azapi_data_plane_resource` resource: Support `Microsoft.Purview/accounts/Scanning/managedvirtualnetworks` type.
 - Support a default retry policy that retries when GET request fails with 404 status code after resource creation.
-- `azapi_resource`, `azapi_update_resource` resources and data sources' `output` field defaults to the readonly fields when the `response_export_values` is not specified.
-- `azapi_resource_list` data source's `output` field defaults to the response when the `response_export_values` is not specified.
 - `azapi` provider: Support `disable_default_output` field, which is used to disable the default output for the resources and data sources.
 - Update bicep types to https://github.com/ms-henglu/bicep-types-az/commit/c3ff45dfffe7f229447639b5982a1e2deadc1b71
 

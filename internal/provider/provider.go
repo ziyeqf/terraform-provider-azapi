@@ -25,6 +25,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/ephemeral"
 	"github.com/hashicorp/terraform-plugin-framework/function"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
@@ -36,6 +37,7 @@ import (
 
 var _ provider.Provider = &Provider{}
 var _ provider.ProviderWithFunctions = &Provider{}
+var _ provider.ProviderWithEphemeralResources = &Provider{}
 
 func AzureProvider() provider.Provider {
 	return &Provider{}
@@ -281,7 +283,7 @@ func (p Provider) Schema(ctx context.Context, request provider.SchemaRequest, re
 
 			"oidc_azure_service_connection_id": schema.StringAttribute{
 				Optional:            true,
-				MarkdownDescription: "The Azure Pipelines Service Connection ID to use for authentication. This can also be sourced from the `ARM_OIDC_AZURE_SERVICE_CONNECTION_ID` environment variable.",
+				MarkdownDescription: "The Azure Pipelines Service Connection ID to use for authentication. This can also be sourced from the `ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID` or `ARM_OIDC_AZURE_SERVICE_CONNECTION_ID` Environment Variables.",
 			},
 
 			"use_oidc": schema.BoolAttribute{
@@ -525,7 +527,9 @@ func (p Provider) Configure(ctx context.Context, request provider.ConfigureReque
 	}
 
 	if model.OIDCAzureServiceConnectionID.IsNull() {
-		if v := os.Getenv("ARM_OIDC_AZURE_SERVICE_CONNECTION_ID"); v != "" {
+		if v := os.Getenv("ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID"); v != "" {
+			model.OIDCAzureServiceConnectionID = types.StringValue(v)
+		} else if v := os.Getenv("ARM_OIDC_AZURE_SERVICE_CONNECTION_ID"); v != "" {
 			model.OIDCAzureServiceConnectionID = types.StringValue(v)
 		}
 	}
@@ -686,6 +690,7 @@ func (p Provider) Configure(ctx context.Context, request provider.ConfigureReque
 
 	response.ResourceData = client
 	response.DataSourceData = client
+	response.EphemeralResourceData = client
 }
 
 func (p Provider) Functions(ctx context.Context) []func() function.Function {
@@ -740,6 +745,14 @@ func (p Provider) Resources(ctx context.Context) []func() resource.Resource {
 		},
 		func() resource.Resource {
 			return &services.DataPlaneResource{}
+		},
+	}
+}
+
+func (p Provider) EphemeralResources(ctx context.Context) []func() ephemeral.EphemeralResource {
+	return []func() ephemeral.EphemeralResource{
+		func() ephemeral.EphemeralResource {
+			return &services.ActionEphemeral{}
 		},
 	}
 }

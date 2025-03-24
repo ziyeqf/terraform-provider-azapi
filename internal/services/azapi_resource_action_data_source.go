@@ -10,6 +10,7 @@ import (
 	"github.com/Azure/terraform-provider-azapi/internal/retry"
 	"github.com/Azure/terraform-provider-azapi/internal/services/myvalidator"
 	"github.com/Azure/terraform-provider-azapi/internal/services/parse"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -17,21 +18,24 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 )
 
 type ResourceActionDataSourceModel struct {
-	ID                   types.String        `tfsdk:"id"`
-	ResourceID           types.String        `tfsdk:"resource_id"`
-	Type                 types.String        `tfsdk:"type"`
-	Action               types.String        `tfsdk:"action"`
-	Method               types.String        `tfsdk:"method"`
-	Body                 types.Dynamic       `tfsdk:"body"`
-	ResponseExportValues types.Dynamic       `tfsdk:"response_export_values"`
-	Output               types.Dynamic       `tfsdk:"output"`
-	Timeouts             timeouts.Value      `tfsdk:"timeouts"`
-	Retry                retry.RetryValue    `tfsdk:"retry"`
-	Headers              map[string]string   `tfsdk:"headers"`
-	QueryParameters      map[string][]string `tfsdk:"query_parameters"`
+	ID                            types.String     `tfsdk:"id"`
+	ResourceID                    types.String     `tfsdk:"resource_id"`
+	Type                          types.String     `tfsdk:"type"`
+	Action                        types.String     `tfsdk:"action"`
+	Method                        types.String     `tfsdk:"method"`
+	Body                          types.Dynamic    `tfsdk:"body"`
+	ResponseExportValues          types.Dynamic    `tfsdk:"response_export_values"`
+	SensitiveResponseExportValues types.Dynamic    `tfsdk:"sensitive_response_export_values"`
+	Output                        types.Dynamic    `tfsdk:"output"`
+	SensitiveOutput               types.Dynamic    `tfsdk:"sensitive_output"`
+	Timeouts                      timeouts.Value   `tfsdk:"timeouts"`
+	Retry                         retry.RetryValue `tfsdk:"retry"`
+	Headers                       types.Map        `tfsdk:"headers"`
+	QueryParameters               types.Map        `tfsdk:"query_parameters"`
 }
 
 type ResourceActionDataSource struct {
@@ -97,11 +101,25 @@ func (r *ResourceActionDataSource) Schema(ctx context.Context, request datasourc
 				},
 			},
 
-			"response_export_values": CommonAttributeResponseExportValues(),
+			"response_export_values": schema.DynamicAttribute{
+				Optional:            true,
+				MarkdownDescription: docstrings.ResponseExportValues(),
+			},
+
+			"sensitive_response_export_values": schema.DynamicAttribute{
+				Optional:            true,
+				MarkdownDescription: docstrings.SensitiveResponseExportValues(),
+			},
 
 			"output": schema.DynamicAttribute{
 				Computed:            true,
 				MarkdownDescription: docstrings.Output("data.azapi_resource_action"),
+			},
+
+			"sensitive_output": schema.DynamicAttribute{
+				Computed:            true,
+				Sensitive:           true,
+				MarkdownDescription: docstrings.SensitiveOutput("data.azapi_resource_action"),
 			},
 
 			"retry": retry.SingleNestedAttribute(ctx),
@@ -152,6 +170,8 @@ func (r *ResourceActionDataSource) Read(ctx context.Context, request datasource.
 		return
 	}
 
+	ctx = tflog.SetField(ctx, "resource_id", id.ID())
+
 	var requestBody interface{}
 	if err := unmarshalBody(model.Body, &requestBody); err != nil {
 		response.Diagnostics.AddError("Invalid body", fmt.Sprintf(`The argument "body" is invalid: %s`, err.Error()))
@@ -166,17 +186,19 @@ func (r *ResourceActionDataSource) Read(ctx context.Context, request datasource.
 	var client clients.Requester
 	client = r.ProviderData.ResourceClient
 	if !model.Retry.IsNull() && !model.Retry.IsUnknown() {
-		bkof, regexps := clients.NewRetryableErrors(
-			model.Retry.GetIntervalSeconds(),
-			model.Retry.GetMaxIntervalSeconds(),
-			model.Retry.GetMultiplier(),
-			model.Retry.GetRandomizationFactor(),
-			model.Retry.GetErrorMessageRegex(),
+		regexps := clients.StringSliceToRegexpSliceMust(model.Retry.GetErrorMessages())
+		bkof := backoff.NewExponentialBackOff(
+			backoff.WithInitialInterval(model.Retry.GetIntervalSecondsAsDuration()),
+			backoff.WithMaxInterval(model.Retry.GetMaxIntervalSecondsAsDuration()),
+			backoff.WithMultiplier(model.Retry.GetMultiplier()),
+			backoff.WithRandomizationFactor(model.Retry.GetRandomizationFactor()),
+			backoff.WithMaxElapsedTime(readTimeout),
 		)
+		tflog.Debug(ctx, "data.azapi_resource_action.Read is using retry")
 		client = r.ProviderData.ResourceClient.WithRetry(bkof, regexps, nil, nil)
 	}
 
-	responseBody, err := client.Action(ctx, id.AzureResourceId, model.Action.ValueString(), id.ApiVersion, method, requestBody, clients.NewRequestOptions(model.Headers, model.QueryParameters))
+	responseBody, err := client.Action(ctx, id.AzureResourceId, model.Action.ValueString(), id.ApiVersion, method, requestBody, clients.NewRequestOptions(AsMapOfString(model.Headers), AsMapOfLists(model.QueryParameters)))
 	if err != nil {
 		response.Diagnostics.AddError("Failed to perform action", fmt.Errorf("performing action %s of %q: %+v", model.Action.ValueString(), id, err).Error())
 		return
@@ -190,6 +212,13 @@ func (r *ResourceActionDataSource) Read(ctx context.Context, request datasource.
 		return
 	}
 	model.Output = output
+
+	sensitiveOutput, err := buildOutputFromBody(responseBody, model.SensitiveResponseExportValues, nil)
+	if err != nil {
+		response.Diagnostics.AddError("Failed to build sensitive output", err.Error())
+		return
+	}
+	model.SensitiveOutput = sensitiveOutput
 
 	response.Diagnostics.Append(response.State.Set(ctx, &model)...)
 }

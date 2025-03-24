@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -575,7 +577,7 @@ func (v RetryValue) AttributeTypes(ctx context.Context) map[string]attr.Type {
 	}
 }
 
-func (v RetryValue) GetErrorMessageRegex() []string {
+func (v RetryValue) GetErrorMessages() []string {
 	if v.IsNull() {
 		return nil
 	}
@@ -589,12 +591,32 @@ func (v RetryValue) GetErrorMessageRegex() []string {
 	return res
 }
 
+func (v RetryValue) GetErrorMessagesRegex() []regexp.Regexp {
+	msgs := v.GetErrorMessages()
+	if msgs == nil {
+		return nil
+	}
+	res := make([]regexp.Regexp, len(msgs))
+	for i, msg := range msgs {
+		res[i] = *regexp.MustCompile(msg)
+	}
+	return res
+}
+
 func (v RetryValue) GetIntervalSeconds() int {
 	return v.getInt64AttrValue(intervalSecondsAttributeName)
 }
 
+func (v RetryValue) GetIntervalSecondsAsDuration() time.Duration {
+	return time.Duration(v.IntervalSeconds.ValueInt64()) * time.Second
+}
+
 func (v RetryValue) GetMaxIntervalSeconds() int {
 	return v.getInt64AttrValue(maxIntervalSecondsAttributeName)
+}
+
+func (v RetryValue) GetMaxIntervalSecondsAsDuration() time.Duration {
+	return time.Duration(v.MaxIntervalSeconds.ValueInt64()) * time.Second
 }
 
 func (v RetryValue) GetMultiplier() float64 {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/Azure/terraform-provider-azapi/internal/clients"
@@ -16,7 +17,9 @@ import (
 	"github.com/Azure/terraform-provider-azapi/internal/services/myplanmodifier"
 	"github.com/Azure/terraform-provider-azapi/internal/services/myvalidator"
 	"github.com/Azure/terraform-provider-azapi/internal/services/parse"
+	"github.com/Azure/terraform-provider-azapi/internal/skip"
 	"github.com/Azure/terraform-provider-azapi/utils"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -32,23 +35,23 @@ import (
 )
 
 type AzapiUpdateResourceModel struct {
-	ID                    types.String        `tfsdk:"id"`
-	Name                  types.String        `tfsdk:"name"`
-	ParentID              types.String        `tfsdk:"parent_id"`
-	ResourceID            types.String        `tfsdk:"resource_id"`
-	Type                  types.String        `tfsdk:"type"`
-	Body                  types.Dynamic       `tfsdk:"body"`
-	IgnoreCasing          types.Bool          `tfsdk:"ignore_casing"`
-	IgnoreMissingProperty types.Bool          `tfsdk:"ignore_missing_property"`
-	ResponseExportValues  types.Dynamic       `tfsdk:"response_export_values"`
-	Locks                 types.List          `tfsdk:"locks"`
-	Output                types.Dynamic       `tfsdk:"output"`
-	Timeouts              timeouts.Value      `tfsdk:"timeouts"`
-	Retry                 retry.RetryValue    `tfsdk:"retry"`
-	UpdateHeaders         map[string]string   `tfsdk:"update_headers"`
-	UpdateQueryParameters map[string][]string `tfsdk:"update_query_parameters"`
-	ReadHeaders           map[string]string   `tfsdk:"read_headers"`
-	ReadQueryParameters   map[string][]string `tfsdk:"read_query_parameters"`
+	ID                    types.String     `tfsdk:"id"`
+	Name                  types.String     `tfsdk:"name"`
+	ParentID              types.String     `tfsdk:"parent_id"`
+	ResourceID            types.String     `tfsdk:"resource_id"`
+	Type                  types.String     `tfsdk:"type"`
+	Body                  types.Dynamic    `tfsdk:"body"`
+	IgnoreCasing          types.Bool       `tfsdk:"ignore_casing"`
+	IgnoreMissingProperty types.Bool       `tfsdk:"ignore_missing_property"`
+	ResponseExportValues  types.Dynamic    `tfsdk:"response_export_values"`
+	Locks                 types.List       `tfsdk:"locks"`
+	Output                types.Dynamic    `tfsdk:"output"`
+	Timeouts              timeouts.Value   `tfsdk:"timeouts" skip_on:"update"`
+	Retry                 retry.RetryValue `tfsdk:"retry" skip_on:"update"`
+	UpdateHeaders         types.Map        `tfsdk:"update_headers"`
+	UpdateQueryParameters types.Map        `tfsdk:"update_query_parameters"`
+	ReadHeaders           types.Map        `tfsdk:"read_headers" skip_on:"update"`
+	ReadQueryParameters   types.Map        `tfsdk:"read_query_parameters" skip_on:"update"`
 }
 
 type AzapiUpdateResource struct {
@@ -165,7 +168,13 @@ func (r *AzapiUpdateResource) Schema(ctx context.Context, request resource.Schem
 				MarkdownDescription: docstrings.IgnoreMissingProperty(),
 			},
 
-			"response_export_values": CommonAttributeResponseExportValues(),
+			"response_export_values": schema.DynamicAttribute{
+				Optional: true,
+				PlanModifiers: []planmodifier.Dynamic{
+					myplanmodifier.DynamicUseStateWhen(dynamic.SemanticallyEqual),
+				},
+				MarkdownDescription: docstrings.ResponseExportValues(),
+			},
 
 			"locks": schema.ListAttribute{
 				ElementType: types.StringType,
@@ -294,6 +303,21 @@ func (r *AzapiUpdateResource) Create(ctx context.Context, request resource.Creat
 }
 
 func (r *AzapiUpdateResource) Update(ctx context.Context, request resource.UpdateRequest, response *resource.UpdateResponse) {
+	// See if we can skip the external API call (changes are to state only)
+	var plan, state AzapiUpdateResourceModel
+	if response.Diagnostics.Append(request.Plan.Get(ctx, &plan)...); response.Diagnostics.HasError() {
+		return
+	}
+	if response.Diagnostics.Append(request.State.Get(ctx, &state)...); response.Diagnostics.HasError() {
+		return
+	}
+	if skip.CanSkipExternalRequest(plan, state, "update") {
+		tflog.Debug(ctx, "azapi_resource.CreateUpdate skipping external request as no unskippable changes were detected")
+		response.Diagnostics.Append(request.State.Set(ctx, plan)...)
+		return
+	}
+	tflog.Debug(ctx, "azapi_resource.CreateUpdate proceeding with external request as no skippable changes were detected")
+
 	r.CreateUpdate(ctx, request.Plan, &response.State, &response.Diagnostics)
 }
 
@@ -341,19 +365,22 @@ func (r *AzapiUpdateResource) CreateUpdate(ctx context.Context, plan tfsdk.Plan,
 		id = buildId
 	}
 
+	ctx = tflog.SetField(ctx, "resource_id", id.ID())
+
 	var client clients.Requester
 	client = r.ProviderData.ResourceClient
 	if !model.Retry.IsNull() && !model.Retry.IsUnknown() {
-		bkof, regexps := clients.NewRetryableErrors(
-			model.Retry.GetIntervalSeconds(),
-			model.Retry.GetMaxIntervalSeconds(),
-			model.Retry.GetMultiplier(),
-			model.Retry.GetRandomizationFactor(),
-			model.Retry.GetErrorMessageRegex(),
+		regexps := clients.StringSliceToRegexpSliceMust(model.Retry.GetErrorMessages())
+		bkof := backoff.NewExponentialBackOff(
+			backoff.WithInitialInterval(model.Retry.GetMaxIntervalSecondsAsDuration()),
+			backoff.WithMaxInterval(model.Retry.GetMaxIntervalSecondsAsDuration()),
+			backoff.WithMultiplier(model.Retry.GetMultiplier()),
+			backoff.WithRandomizationFactor(model.Retry.GetRandomizationFactor()),
+			backoff.WithMaxElapsedTime(timeout),
 		)
 		client = r.ProviderData.ResourceClient.WithRetry(bkof, regexps, nil, nil)
 	}
-	existing, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(model.ReadHeaders, model.ReadQueryParameters))
+	existing, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(AsMapOfString(model.ReadHeaders), AsMapOfLists(model.ReadQueryParameters)))
 	if err != nil {
 		diagnostics.AddError("Failed to retrieve resource", fmt.Errorf("checking for presence of existing %s: %+v", id, err).Error())
 		return
@@ -375,18 +402,20 @@ func (r *AzapiUpdateResource) CreateUpdate(ctx context.Context, plan tfsdk.Plan,
 		requestBody = (*id.ResourceDef).GetWriteOnly(utils.NormalizeObject(requestBody))
 	}
 
-	for _, id := range AsStringList(model.Locks) {
-		locks.ByID(id)
-		defer locks.UnlockByID(id)
+	lockIds := AsStringList(model.Locks)
+	slices.Sort(lockIds)
+	for _, lockId := range lockIds {
+		locks.ByID(lockId)
+		defer locks.UnlockByID(lockId)
 	}
 
-	_, err = client.CreateOrUpdate(ctx, id.AzureResourceId, id.ApiVersion, requestBody, clients.NewRequestOptions(model.UpdateHeaders, model.UpdateQueryParameters))
+	_, err = client.CreateOrUpdate(ctx, id.AzureResourceId, id.ApiVersion, requestBody, clients.NewRequestOptions(AsMapOfString(model.UpdateHeaders), AsMapOfLists(model.UpdateQueryParameters)))
 	if err != nil {
 		diagnostics.AddError("Failed to update resource", fmt.Errorf("updating %q: %+v", id, err).Error())
 		return
 	}
 
-	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(model.ReadHeaders, model.ReadQueryParameters))
+	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(AsMapOfString(model.ReadHeaders), AsMapOfLists(model.ReadQueryParameters)))
 	if err != nil {
 		if utils.ResponseErrorWasNotFound(err) {
 			tflog.Info(ctx, fmt.Sprintf("Error reading %q - removing from state", id.ID()))
@@ -405,6 +434,7 @@ func (r *AzapiUpdateResource) CreateUpdate(ctx context.Context, plan tfsdk.Plan,
 	var defaultOutput interface{}
 	if !r.ProviderData.Features.DisableDefaultOutput {
 		defaultOutput = id.ResourceDef.GetReadOnly(responseBody)
+		defaultOutput = utils.RemoveFields(defaultOutput, volatileFieldList())
 	}
 	output, err := buildOutputFromBody(responseBody, model.ResponseExportValues, defaultOutput)
 	if err != nil {
@@ -437,20 +467,23 @@ func (r *AzapiUpdateResource) Read(ctx context.Context, request resource.ReadReq
 		return
 	}
 
+	ctx = tflog.SetField(ctx, "resource_id", id.ID())
+
 	var client clients.Requester
 	client = r.ProviderData.ResourceClient
 	if !model.Retry.IsNull() && !model.Retry.IsUnknown() {
-		bkof, regexps := clients.NewRetryableErrors(
-			model.Retry.GetIntervalSeconds(),
-			model.Retry.GetMaxIntervalSeconds(),
-			model.Retry.GetMultiplier(),
-			model.Retry.GetRandomizationFactor(),
-			model.Retry.GetErrorMessageRegex(),
+		regexps := clients.StringSliceToRegexpSliceMust(model.Retry.GetErrorMessages())
+		bkof := backoff.NewExponentialBackOff(
+			backoff.WithInitialInterval(model.Retry.GetMaxIntervalSecondsAsDuration()),
+			backoff.WithMaxInterval(model.Retry.GetMaxIntervalSecondsAsDuration()),
+			backoff.WithMultiplier(model.Retry.GetMultiplier()),
+			backoff.WithRandomizationFactor(model.Retry.GetRandomizationFactor()),
+			backoff.WithMaxElapsedTime(readTimeout),
 		)
 		client = r.ProviderData.ResourceClient.WithRetry(bkof, regexps, nil, nil)
 	}
 
-	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(model.ReadHeaders, model.ReadQueryParameters))
+	responseBody, err := client.Get(ctx, id.AzureResourceId, id.ApiVersion, clients.NewRequestOptions(AsMapOfString(model.ReadHeaders), AsMapOfLists(model.ReadQueryParameters)))
 	if err != nil {
 		if utils.ResponseErrorWasNotFound(err) {
 			tflog.Info(ctx, fmt.Sprintf("[INFO] Error reading %q - removing from state", id.ID()))
@@ -489,6 +522,7 @@ func (r *AzapiUpdateResource) Read(ctx context.Context, request resource.ReadReq
 	var defaultOutput interface{}
 	if !r.ProviderData.Features.DisableDefaultOutput {
 		defaultOutput = id.ResourceDef.GetReadOnly(responseBody)
+		defaultOutput = utils.RemoveFields(defaultOutput, volatileFieldList())
 	}
 	output, err := buildOutputFromBody(responseBody, model.ResponseExportValues, defaultOutput)
 	if err != nil {

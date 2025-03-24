@@ -69,6 +69,28 @@ func canResourceHaveProperty(resourceDef *aztypes.ResourceType, property string)
 	return false
 }
 
+func flattenBody(responseBody interface{}, resourceDef *aztypes.ResourceType) (types.Dynamic, error) {
+	body := utils.NormalizeObject(responseBody)
+
+	if resourceDef != nil {
+		writeOnlyBody := (*resourceDef).GetWriteOnly(body)
+		if bodyMap, ok := writeOnlyBody.(map[string]interface{}); ok {
+			delete(bodyMap, "location")
+			delete(bodyMap, "tags")
+			delete(bodyMap, "name")
+			delete(bodyMap, "identity")
+			writeOnlyBody = bodyMap
+		}
+		body = writeOnlyBody
+	}
+
+	data, err := json.Marshal(body)
+	if err != nil {
+		return types.DynamicNull(), err
+	}
+	return dynamic.FromJSONImplied(data)
+}
+
 func flattenOutput(responseBody interface{}, paths []string) attr.Value {
 	for _, path := range paths {
 		if path == "*" {
@@ -133,6 +155,24 @@ func AsStringList(input types.List) []string {
 	diags := input.ElementsAs(context.Background(), &result, false)
 	if diags.HasError() {
 		tflog.Warn(context.Background(), fmt.Sprintf("failed to convert list to string list: %s", diags))
+	}
+	return result
+}
+
+func AsMapOfString(input types.Map) map[string]string {
+	result := make(map[string]string)
+	diags := input.ElementsAs(context.Background(), &result, false)
+	if diags.HasError() {
+		tflog.Warn(context.Background(), fmt.Sprintf("failed to convert input to map of strings: %s", diags))
+	}
+	return result
+}
+
+func AsMapOfLists(input types.Map) map[string][]string {
+	result := make(map[string][]string)
+	diags := input.ElementsAs(context.Background(), &result, false)
+	if diags.HasError() {
+		tflog.Warn(context.Background(), fmt.Sprintf("failed to convert input to map of lists: %s", diags))
 	}
 	return result
 }
